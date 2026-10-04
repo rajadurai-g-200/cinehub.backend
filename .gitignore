@@ -1,0 +1,269 @@
+# ==========================================
+
+# PYTHON
+
+# ==========================================
+
+**pycache**/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# ==========================================
+
+# VIRTUAL ENVIRONMENT
+
+# ==========================================
+
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+
+# DJANGO
+
+# ==========================================
+
+*.log
+db.sqlite3
+db.sqlite3-journal
+*.sqlite3
+*.sqlite3-journal
+
+# Django generated files
+
+staticfiles/
+media/
+
+# ==========================================
+
+# ENVIRONMENT / SECRETS
+
+# ==========================================
+
+.env
+.env.*
+!.env.example
+
+# ==========================================
+
+# DJANGO SECRET / CERTIFICATES
+
+# ==========================================
+
+*.pem
+*.key
+*.crt
+*.cer
+*.cert
+
+# ==========================================
+
+# REACT / NODE
+
+# ==========================================
+
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# React build files
+
+build/
+dist/
+.cache/
+.parcel-cache/
+
+# ==========================================
+
+# IDE / EDITOR
+
+# ==========================================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+
+# ==========================================
+
+# OPERATING SYSTEM
+
+# ==========================================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================================
+
+# PYTHON TESTING
+
+# ==========================================
+
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ==========================================
+
+# JUPYTER
+
+# ==========================================
+
+.ipynb_checkpoints/
+
+# ==========================================
+
+# TEMPORARY FILES
+
+# ==========================================
+
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+
+# ==========================================
+
+# LARGE MEDIA / VIDEO FILES
+
+# ==========================================
+
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wmv
+*.flv
+*.webm
+
+# ==========================================
+
+# LARGE ARCHIVES
+
+# ==========================================
+
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+
+# ==========================================
+
+# FRONTEND ENV FILES
+
+# ==========================================
+
+frontend/.env
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+
+# ==========================================
+
+# BACKEND ENV FILES
+
+# ==========================================
+
+backend/.env
+backend/.env.local
+
+# ==========================================
+
+# LOGS
+
+# ==========================================
+
+logs/
+*.log
+
+# ==========================================
+
+# LOCAL CONFIGURATION
+
+# ==========================================
+
+local_settings.py
+
+# ==========================================
+
+# COVERAGE
+
+# ==========================================
+
+.coverage
+coverage.xml
+
+# ==========================================
+
+# OS / SYSTEM
+
+# ==========================================
+
+$RECYCLE.BIN/
+*.lnk
+
+# ==========================================
+
+# DO NOT IGNORE DJANGO MIGRATIONS
+
+# ==========================================
+
+# migrations/ should NOT be ignored.
+
+# Django migration files should be committed.
+
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Django
+*.log
+db.sqlite3
+*.sqlite3
+
+# Media
+media/
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wmv
+*.webm
+
+# Environment
+.env
+.env.*
+
+# React / Node
+node_modules/
+dist/
+build/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
