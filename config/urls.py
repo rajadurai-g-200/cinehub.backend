@@ -1,26 +1,33 @@
+
 from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 
-
 urlpatterns = [
-    path("admin/", admin.site.urls),
-
+    # Django Admin
     path(
-        "api/auth/",
-        include("accounts.urls")
+        "admin/",
+        admin.site.urls,
     ),
 
+    # Authentication: OTP, Google login, profile, users
+    path(
+        "api/auth/",
+        include("accounts.urls"),
+    ),
+
+    # Movies: creator upload, movie listing, details, approval
     path(
         "api/movies/",
-        include("movies.urls")
+        include("movies.urls"),
     ),
 ]
 
-
+# Serve uploaded movie logos and video files in development.
+# This is for development only, not production deployment.
 if settings.DEBUG:
     urlpatterns += static(
         settings.MEDIA_URL,
-        document_root=settings.MEDIA_ROOT
+        document_root=settings.MEDIA_ROOT,
     )

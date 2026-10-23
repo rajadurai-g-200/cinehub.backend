@@ -1,382 +1,504 @@
+import logging
 import random
+import secrets
+from datetime import timedelta
 
-from django.core.mail import send_mail
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core.mail import send_mail
+from django.utils import timezone
 
-from rest_framework.decorators import (
-    api_view,
-    permission_classes
-)
-
-from rest_framework.permissions import IsAuthenticated
-
-from rest_framework.response import Response
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
 
 from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
 
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import EmailOTP
 
 
-# =========================================================
-# USER MODEL
-# =========================================================
-
+logger = logging.getLogger(__name__)
 User = get_user_model()
 
 
-# =========================================================
-# SEND OTP
-# =========================================================
+# ==================================================
+# HELPERS
+# ==================================================
+
+def get_user_role(user):
+    if user.is_superuser or user.is_staff:
+        return "ADMIN"
+
+    return str(getattr(user, "role", "USER")).upper()
+
+
+def user_response_data(user):
+    email = getattr(user, "email", "") or ""
+
+    return {
+        "id": user.id,
+        "username": (
+            getattr(user, "username", "")
+            or email.split("@")[0]
+        ),
+        "email": email,
+        "role": get_user_role(user),
+        "is_staff": user.is_staff,
+        "is_superuser": user.is_superuser,
+        "is_active": user.is_active,
+    }
+
+
+def jwt_response(user):
+    """
+    Issue CineHub JWT tokens after successful authentication.
+    """
+    refresh = RefreshToken.for_user(user)
+
+    return {
+        "message": "Login successful.",
+        "user": user_response_data(user),
+        "access": str(refresh.access_token),
+        "refresh": str(refresh),
+    }
+
+
+def create_user_for_email(email):
+    """
+    Create a Django user for an email address.
+    Adapt this helper if your custom User model requires
+    additional mandatory fields.
+    """
+    username = email.split("@")[0]
+
+    has_username = any(
+        field.name == "username"
+        for field in User._meta.fields
+    )
+
+    if has_username:
+        if User.objects.filter(username=username).exists():
+            username = f"{username}_{secrets.token_hex(3)}"
+
+        return User.objects.create_user(
+            username=username,
+            email=email,
+            password=secrets.token_urlsafe(32),
+        )
+
+    return User.objects.create_user(
+        email=email,
+        password=secrets.token_urlsafe(32),
+    )
+
+
+def is_admin_user(user):
+    return (
+        user.is_authenticated
+        and (
+            user.is_staff
+            or user.is_superuser
+            or get_user_role(user) == "ADMIN"
+        )
+    )
+
+
+# ==================================================
+# GOOGLE LOGIN
+# POST /api/auth/google/
+# Body: {"credential": "Google ID token"}
+# ==================================================
+
 
 @api_view(["POST"])
+@permission_classes([AllowAny])
+def google_login(request):
+    credential = request.data.get("credential")
+    client_id = settings.GOOGLE_CLIENT_ID.strip()
+
+    if not credential:
+        return Response(
+            {"message": "Google credential is missing."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        google_user = id_token.verify_oauth2_token(
+            credential,
+            google_requests.Request(),
+            audience=client_id,
+        )
+    except ValueError as error:
+        logger.warning("Google token verification failed: %s", error)
+        return Response(
+            {"message": "Google token invalid. Check Client ID and OAuth origin."},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+    except Exception:
+        logger.exception("Google verification service error")
+        return Response(
+            {"message": "Google verification service unavailable."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    email = (google_user.get("email") or "").strip().lower()
+
+    if not email or google_user.get("email_verified") is not True:
+        return Response(
+            {"message": "Use a verified Google account."},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+
+    try:
+        user = User.objects.filter(email__iexact=email).first()
+
+        if user is None:
+            user = create_user_for_email(email)
+
+        if not user.is_active:
+            return Response(
+                {"message": "Account is inactive."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        return Response(jwt_response(user), status=status.HTTP_200_OK)
+
+    except Exception:
+        logger.exception("Google login user creation failed")
+        return Response(
+            {"message": "Unable to complete Google login."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+# ==================================================
+# SEND OTP
+# POST /api/auth/send-otp/
+# Body: {"email": "user@gmail.com"}
+# ==================================================
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
 def send_otp(request):
+    email = (request.data.get("email") or "").strip().lower()
 
-    # Get email from frontend
-    email = request.data.get("email")
-
-    print("====================================")
-    print("SEND OTP REQUEST")
-    print("EMAIL:", email)
-    print("====================================")
-
-    # Check email
     if not email:
         return Response(
-            {
-                "message": "Email is required."
-            },
-            status=status.HTTP_400_BAD_REQUEST
+            {"message": "Email address is required."},
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
-    # Clean email
-    email = email.strip().lower()
+    otp = f"{random.randint(0, 999999):06d}"
 
-    # Check Gmail
-    if not email.endswith("@gmail.com"):
-        return Response(
-            {
-                "message": "Please enter a valid Gmail address."
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    # Generate 6 digit OTP
-    otp = str(
-        random.randint(100000, 999999)
-    )
-
-    print("GENERATED OTP:", otp)
-
-    # Delete old unverified OTP
-    EmailOTP.objects.filter(
-        email=email,
-        is_verified=False
-    ).delete()
-
-    # Create new OTP
-    EmailOTP.objects.create(
-        email=email,
-        otp=otp
-    )
-
-    # Send email
     try:
+        EmailOTP.objects.filter(
+            email__iexact=email
+        ).delete()
+
+        EmailOTP.objects.create(
+            email=email,
+            otp=otp,
+            expires_at=timezone.now() + timedelta(minutes=5),
+        )
 
         send_mail(
-            subject="CineHub Login OTP",
-
-            message=f"""
-Welcome to CineHub!
-
-Your CineHub login OTP is:
-
-{otp}
-
-This OTP is valid for 5 minutes.
-
-Please do not share this OTP with anyone.
-
-CineHub Team
-""",
-
-            from_email=None,
-
-            recipient_list=[
-                email
-            ],
-
-            fail_silently=False
+            subject="Your CineHub verification code",
+            message=(
+                f"Your CineHub OTP is {otp}. "
+                "It expires in 5 minutes."
+            ),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
         )
-
-        print("OTP EMAIL SENT SUCCESSFULLY")
-
-    except Exception as e:
-
-        print("EMAIL ERROR:", e)
 
         return Response(
-            {
-                "message": "Unable to send OTP."
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"message": "OTP sent successfully."},
+            status=status.HTTP_200_OK,
         )
 
-    return Response(
-        {
-            "message": "OTP sent successfully."
-        },
-        status=status.HTTP_200_OK
-    )
+    except Exception:
+        # Do not expose OTPs or SMTP credentials in API responses.
+        logger.exception("Unable to send CineHub OTP.")
+
+        return Response(
+            {"message": "Unable to send OTP. Check email configuration."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
-# =========================================================
+# ==================================================
 # VERIFY OTP
-# =========================================================
+# POST /api/auth/verify-otp/
+# Body: {"email": "...", "otp": "...", "role": "USER"}
+# ==================================================
 
 @api_view(["POST"])
+@permission_classes([AllowAny])
 def verify_otp(request):
+    email = (request.data.get("email") or "").strip().lower()
+    otp = (request.data.get("otp") or "").strip()
 
-    # Get email
-    email = request.data.get("email")
+    requested_role = (
+        request.data.get("role") or "USER"
+    ).strip().upper()
 
-    print("====================================")
-    print("VERIFY OTP REQUEST")
-    print("EMAIL:", email)
-
-    # Check email
-    if not email:
+    if not email or not otp:
         return Response(
-            {
-                "message": "Email is required."
-            },
-            status=status.HTTP_400_BAD_REQUEST
+            {"message": "Email and OTP are required."},
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
-    # Clean email
-    email = email.strip().lower()
-
-    # Get OTP
-    otp = request.data.get("otp")
-
-    print("OTP:", otp)
-
-    # Check OTP
-    if not otp:
+    if requested_role not in ("USER", "CREATOR"):
         return Response(
-            {
-                "message": "OTP is required."
-            },
-            status=status.HTTP_400_BAD_REQUEST
+            {"message": "Invalid account role."},
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
-    # Convert OTP to string
-    otp = str(otp).strip()
-
-    # Find OTP
-    otp_object = EmailOTP.objects.filter(
-        email=email,
+    record = EmailOTP.objects.filter(
+        email__iexact=email,
         otp=otp,
-        is_verified=False
-    ).last()
+    ).first()
 
-    print("OTP OBJECT:", otp_object)
-
-    # Invalid OTP
-    if not otp_object:
-
-        print("INVALID OTP")
-
+    if record is None:
         return Response(
-            {
-                "message": "Invalid OTP."
-            },
-            status=status.HTTP_400_BAD_REQUEST
+            {"message": "Invalid OTP."},
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
-    # Check expiry
-    if otp_object.is_expired():
-
-        print("OTP EXPIRED")
-
-        otp_object.delete()
+    if record.expires_at <= timezone.now():
+        record.delete()
 
         return Response(
-            {
-                "message": "OTP expired. Please request a new OTP."
-            },
-            status=status.HTTP_400_BAD_REQUEST
+            {"message": "OTP expired. Request a new OTP."},
+            status=status.HTTP_400_BAD_REQUEST,
         )
-
-    # Mark OTP verified
-    otp_object.is_verified = True
-    otp_object.save()
-
-    print("OTP VERIFIED SUCCESSFULLY")
-
-    # =====================================================
-    # CREATE / GET USER
-    # =====================================================
 
     try:
+        user = User.objects.filter(
+            email__iexact=email
+        ).first()
 
-        user, created = User.objects.get_or_create(
-            email=email,
-            defaults={
-                "username": email.split("@")[0]
-            }
-        )
+        if user is None:
+            user = create_user_for_email(email)
 
-        print("USER:", user)
-        print("USER CREATED:", created)
+        if not user.is_active:
+            return Response(
+                {"message": "This account is inactive."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
-    except Exception as e:
+        # Never grant ADMIN through public OTP verification.
+        if hasattr(user, "role"):
+            current_role = get_user_role(user)
 
-        print("USER ERROR:", e)
+            if current_role not in ("ADMIN", "CREATOR"):
+                user.role = requested_role
+                user.save(update_fields=["role"])
 
-        return Response(
-            {
-                "message": "Unable to create user."
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-    # =====================================================
-    # CREATE JWT
-    # =====================================================
-
-    try:
-
-        refresh = RefreshToken.for_user(
-            user
-        )
-
-        access_token = str(
-            refresh.access_token
-        )
-
-        refresh_token = str(
-            refresh
-        )
-
-        print("JWT CREATED SUCCESSFULLY")
-
-    except Exception as e:
-
-        print("JWT ERROR:", e)
+        record.delete()
 
         return Response(
-            {
-                "message": "Unable to create login token."
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            jwt_response(user),
+            status=status.HTTP_200_OK,
         )
 
-    print("LOGIN SUCCESS")
-    print("====================================")
+    except Exception:
+        logger.exception("OTP verification failed.")
 
-    # =====================================================
-    # RESPONSE
-    # =====================================================
-
-    return Response(
-        {
-            "message": "Login successful",
-
-            "access": access_token,
-
-            "refresh": refresh_token,
-
-            "user": {
-                "id": user.id,
-                "username": user.username,
-                "email": user.email,
-                "role": user.role
-            }
-        },
-
-        status=status.HTTP_200_OK
-    )
+        return Response(
+            {"message": "Unable to complete login."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
-# =========================================================
+# ==================================================
 # PROFILE SETUP
-# =========================================================
+# POST /api/auth/profile-setup/
+# ==================================================
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def profile_setup(request):
-
-    # Get name
-    username = request.data.get(
-        "username"
-    )
-
-    # Get role
-    role = request.data.get(
-        "role"
-    )
-
-    print("PROFILE SETUP")
-    print("USERNAME:", username)
-    print("ROLE:", role)
-
-    # Check name
-    if not username:
-
-        return Response(
-            {
-                "message": "Name is required."
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    # Clean name
-    username = username.strip()
-
-    if not username:
-
-        return Response(
-            {
-                "message": "Name cannot be empty."
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    # Check role
-    if role not in [
-        "USER",
-        "CREATOR"
-    ]:
-
-        return Response(
-            {
-                "message": "Invalid role. Choose USER or CREATOR."
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    # Current logged-in user
     user = request.user
+    data = request.data
 
-    # Update user
-    user.username = username
-    user.role = role
+    updated_fields = []
 
-    user.save()
+    for field in ("first_name", "last_name"):
+        if field in data and hasattr(user, field):
+            setattr(user, field, str(data[field]).strip())
+            updated_fields.append(field)
+
+    if updated_fields:
+        user.save(update_fields=updated_fields)
 
     return Response(
         {
-            "message": "Profile setup completed.",
-
-            "user": {
-                "id": user.id,
-                "username": user.username,
-                "email": user.email,
-                "role": user.role
-            }
+            "message": "Profile updated successfully.",
+            "user": user_response_data(user),
         },
+        status=status.HTTP_200_OK,
+    )
 
-        status=status.HTTP_200_OK
+
+# ==================================================
+# CURRENT USER
+# GET /api/auth/me/
+# ==================================================
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def current_user(request):
+    return Response(
+        {"user": user_response_data(request.user)},
+        status=status.HTTP_200_OK,
+    )
+
+
+# ==================================================
+# HEARTBEAT
+# GET /api/auth/heartbeat/
+# ==================================================
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def heartbeat(request):
+    return Response(
+        {
+            "message": "CineHub connection is active.",
+            "authenticated": True,
+            "user_id": request.user.id,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+# ==================================================
+# LOGOUT
+# POST /api/auth/logout/
+# Body: {"refresh": "CineHub refresh token"}
+# ==================================================
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def logout_user(request):
+    refresh_token = request.data.get("refresh")
+
+    if refresh_token:
+        try:
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+
+        except Exception:
+            logger.warning(
+                "Refresh token could not be blacklisted.",
+                exc_info=True,
+            )
+
+    return Response(
+        {
+            "message": (
+                "Logged out. Clear access and refresh tokens "
+                "in the frontend."
+            )
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+# Backwards-compatible import name.
+logout = logout_user
+
+
+# ==================================================
+# ADMIN USERS
+# GET /api/auth/admin/users/
+# ==================================================
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def admin_users(request):
+    if not is_admin_user(request.user):
+        return Response(
+            {"message": "Admin permission required."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    users = User.objects.all().order_by("-date_joined")
+    results = []
+
+    for user in users:
+        joined = getattr(user, "date_joined", None)
+        last_login = getattr(user, "last_login", None)
+
+        results.append(
+            {
+                **user_response_data(user),
+                "date_joined": (
+                    joined.isoformat() if joined else None
+                ),
+                "last_seen": (
+                    last_login.isoformat() if last_login else None
+                ),
+                "is_online": False,
+            }
+        )
+
+    return Response(results, status=status.HTTP_200_OK)
+
+
+# ==================================================
+# ADMIN STATISTICS
+# GET /api/auth/admin/statistics/
+# ==================================================
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def admin_statistics(request):
+    if not is_admin_user(request.user):
+        return Response(
+            {"message": "Admin permission required."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    from movies.models import Movie
+
+    all_users = User.objects.all()
+    user_fields = {
+        field.name for field in User._meta.fields
+    }
+
+    total_creators = 0
+
+    if "role" in user_fields:
+        total_creators = all_users.filter(
+            role__iexact="CREATOR"
+        ).count()
+
+    return Response(
+        {
+            "total_users": all_users.filter(
+                is_staff=False,
+                is_superuser=False,
+            ).count(),
+            "total_creators": total_creators,
+            "online_users": 0,
+            "online_creators": 0,
+            "total_movies": Movie.objects.count(),
+            "pending_movies": Movie.objects.filter(
+                status="PENDING"
+            ).count(),
+            "approved_movies": Movie.objects.filter(
+                status="APPROVED"
+            ).count(),
+            "rejected_movies": Movie.objects.filter(
+                status="REJECTED"
+            ).count(),
+        },
+        status=status.HTTP_200_OK,
     )
