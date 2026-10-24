@@ -113,17 +113,24 @@ def is_admin_user(user):
 # Body: {"credential": "Google ID token"}
 # ==================================================
 
-
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def google_login(request):
     credential = request.data.get("credential")
-    client_id = settings.GOOGLE_CLIENT_ID.strip()
+
+    client_id = getattr(settings, "GOOGLE_CLIENT_ID", "") or ""
+    client_id = client_id.strip()
 
     if not credential:
         return Response(
             {"message": "Google credential is missing."},
             status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if not client_id:
+        return Response(
+            {"message": "Google login is not configured."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
     try:
@@ -132,16 +139,15 @@ def google_login(request):
             google_requests.Request(),
             audience=client_id,
         )
-    except ValueError as error:
-        logger.warning("Google token verification failed: %s", error)
+    except ValueError:
         return Response(
-            {"message": "Google token invalid. Check Client ID and OAuth origin."},
+            {"message": "Google token is invalid or expired."},
             status=status.HTTP_401_UNAUTHORIZED,
         )
     except Exception:
-        logger.exception("Google verification service error")
+        logger.exception("Google token verification failed.")
         return Response(
-            {"message": "Google verification service unavailable."},
+            {"message": "Google verification service is unavailable."},
             status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
@@ -149,31 +155,34 @@ def google_login(request):
 
     if not email or google_user.get("email_verified") is not True:
         return Response(
-            {"message": "Use a verified Google account."},
+            {"message": "Please use a verified Google account."},
             status=status.HTTP_401_UNAUTHORIZED,
         )
 
     try:
         user = User.objects.filter(email__iexact=email).first()
+        is_new_user = user is None
 
-        if user is None:
+        if is_new_user:
             user = create_user_for_email(email)
 
         if not user.is_active:
             return Response(
-                {"message": "Account is inactive."},
+                {"message": "This account is inactive."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        return Response(jwt_response(user), status=status.HTTP_200_OK)
+        response_data = jwt_response(user)
+        response_data["is_new_user"] = is_new_user
+
+        return Response(response_data, status=status.HTTP_200_OK)
 
     except Exception:
-        logger.exception("Google login user creation failed")
+        logger.exception("Google login user creation failed.")
         return Response(
             {"message": "Unable to complete Google login."},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
-
 
 # ==================================================
 # SEND OTP

@@ -1,4 +1,7 @@
+
 import logging
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from django.shortcuts import get_object_or_404
@@ -10,7 +13,7 @@ from rest_framework.decorators import (
     parser_classes,
 )
 from rest_framework.parsers import MultiPartParser, FormParser
-from rest_framework.permissions import IsAuthenticated, IsAdminUser
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .models import Movie, MovieQuality
@@ -19,27 +22,58 @@ from .serializers import MovieUploadSerializer
 
 logger = logging.getLogger(__name__)
 
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mkv", ".mov"}
+ALLOWED_LANGUAGES = {"TAMIL", "ENGLISH"}
+ALLOWED_QUALITIES = {"HD", "FULL_HD"}
+ALLOWED_RATINGS = (Decimal("0.0"), Decimal("10.0"))
+
+
+# =========================================================
+# PERMISSIONS
+# =========================================================
+
+def is_admin(user):
+    return bool(
+        user
+        and user.is_authenticated
+        and (
+            user.is_staff
+            or user.is_superuser
+            or getattr(user, "role", None) == "ADMIN"
+        )
+    )
+
+
+def is_creator(user):
+    return bool(
+        user
+        and user.is_authenticated
+        and getattr(user, "role", None) == "CREATOR"
+        and not is_admin(user)
+    )
+
+
+def require_admin(request):
+    if not is_admin(request.user):
+        return Response(
+            {"error": "Admin access required."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    return None
+
 
 # =========================================================
 # HELPERS
 # =========================================================
 
-def is_admin(user):
-    return (
-        user.is_authenticated
-        and (user.is_staff or user.is_superuser)
-    )
-
-
-def is_creator(user):
-    return (
-        user.is_authenticated
-        and getattr(user, "role", None) == "CREATOR"
-    )
+def upload_error(
+    message,
+    http_status=status.HTTP_400_BAD_REQUEST,
+):
+    return Response({"error": message}, status=http_status)
 
 
 def absolute_file_url(request, file_field):
-    """Return an absolute URL for an uploaded file."""
     if not file_field:
         return None
 
@@ -49,17 +83,48 @@ def absolute_file_url(request, file_field):
         return None
 
 
+def parse_rating(value):
+    """Accept ratings from 0.0 through 10.0 with one decimal place."""
+
+    try:
+        rating = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError(
+            "Rating must be a number between 0.0 and 10.0."
+        )
+
+    if not rating.is_finite():
+        raise ValueError("Rating must be a finite number.")
+
+    if not ALLOWED_RATINGS[0] <= rating <= ALLOWED_RATINGS[1]:
+        raise ValueError("Rating must be between 0.0 and 10.0.")
+
+    if rating.as_tuple().exponent < -1:
+        raise ValueError(
+            "Rating can have only one decimal place, for example 8.5."
+        )
+
+    return rating.quantize(Decimal("0.1"))
+
+
+def get_movie_queryset():
+    return (
+        Movie.objects.select_related("creator")
+        .prefetch_related("quality_files")
+    )
+
+
 def movie_data(request, movie):
-    """Convert a Movie instance into JSON-compatible data."""
+    """Serialize a movie and include its rating in every movie endpoint."""
 
-    quality_files = []
-
-    for item in movie.quality_files.all():
-        quality_files.append({
+    quality_files = [
+        {
             "id": item.id,
             "quality": item.quality,
             "file": absolute_file_url(request, item.file),
-        })
+        }
+        for item in movie.quality_files.all()
+    ]
 
     creator = movie.creator
 
@@ -82,26 +147,25 @@ def movie_data(request, movie):
             "id": creator.id,
             "username": creator.username,
             "email": creator.email,
-            "role": creator.get_display_role(),
+            "role": getattr(creator, "role", "USER"),
         },
         "created_at": movie.created_at.isoformat(),
         "updated_at": movie.updated_at.isoformat(),
     }
 
 
-def get_movie_queryset():
-    """Use the same optimized queryset for movie responses."""
-    return (
-        Movie.objects.select_related("creator")
-        .prefetch_related("quality_files")
-    )
+def validate_video_file(video):
+    if not video:
+        return None
 
+    extension = Path(video.name).suffix.lower()
 
-def upload_error(message, http_status=status.HTTP_400_BAD_REQUEST):
-    return Response(
-        {"error": message},
-        status=http_status,
-    )
+    if extension not in ALLOWED_VIDEO_EXTENSIONS:
+        return (
+            "Only MP4, WEBM, MKV and MOV video files are allowed."
+        )
+
+    return None
 
 
 # =========================================================
@@ -118,7 +182,15 @@ def create_movie_from_request(request, creator, movie_status):
     genres = data.get("genres")
     language = data.get("language")
     quality = data.get("quality") or "HD"
-    rating = data.get("rating", 0)
+
+    # Creators may supply a rating. Admin uploads start at 0.0.
+    if is_creator(creator):
+        try:
+            rating = parse_rating(data.get("rating", "0.0"))
+        except ValueError as error:
+            return upload_error(str(error))
+    else:
+        rating = Decimal("0.0")
 
     logo = request.FILES.get("logo")
     movie_file = request.FILES.get("movie_file")
@@ -127,7 +199,6 @@ def create_movie_from_request(request, creator, movie_status):
     video_720 = request.FILES.get("video_720p")
     video_480 = request.FILES.get("video_480p")
 
-    # Required text fields
     required_fields = {
         "title": title,
         "release_date": release_date,
@@ -138,48 +209,25 @@ def create_movie_from_request(request, creator, movie_status):
     }
 
     for field, value in required_fields.items():
-        if not value:
+        if not value or not str(value).strip():
             return upload_error(f"{field} is required.")
 
-    # Required poster
     if not logo:
         return upload_error("Movie poster/logo is required.")
 
-    # Validate language
-    if language not in ("TAMIL", "ENGLISH"):
-        return upload_error(
-            "Language must be TAMIL or ENGLISH."
-        )
+    if language not in ALLOWED_LANGUAGES:
+        return upload_error("Language must be TAMIL or ENGLISH.")
 
-    # Validate movie quality field
-    if quality not in ("HD", "FULL_HD"):
-        return upload_error(
-            "Quality must be HD or FULL_HD."
-        )
-
-    # Validate rating
-    try:
-        rating = float(rating)
-
-        if not 0 <= rating <= 10:
-            raise ValueError
-
-    except (ValueError, TypeError):
-        return upload_error(
-            "Rating must be a number between 0 and 10."
-        )
-
-    # Validate date before saving
-    from datetime import date
+    if quality not in ALLOWED_QUALITIES:
+        return upload_error("Quality must be HD or FULL_HD.")
 
     try:
-        date.fromisoformat(str(release_date))
+        parsed_date = date.fromisoformat(str(release_date))
     except (ValueError, TypeError):
         return upload_error(
             "Release date must use YYYY-MM-DD format."
         )
 
-    # Validate uploaded video extensions
     videos = [
         video_1080,
         video_720,
@@ -187,39 +235,24 @@ def create_movie_from_request(request, creator, movie_status):
         movie_file,
     ]
 
-    allowed_extensions = {
-        ".mp4",
-        ".webm",
-        ".mkv",
-        ".mov",
-    }
-
     for video in videos:
-        if not video:
-            continue
+        error = validate_video_file(video)
+        if error:
+            return upload_error(error)
 
-        extension = Path(video.name).suffix.lower()
-
-        if extension not in allowed_extensions:
-            return upload_error(
-                "Only MP4, WEBM, MKV and MOV video files are allowed."
-            )
-
-    # At least one video is required
     if not any(videos):
-        return upload_error(
-            "Upload at least one movie video file."
-        )
+        return upload_error("Upload at least one movie video file.")
 
-    # Create the movie
+    movie = None
+
     try:
         movie = Movie.objects.create(
             creator=creator,
-            title=title,
-            release_date=release_date,
-            director=director,
-            starring=starring,
-            genres=genres,
+            title=str(title).strip(),
+            release_date=parsed_date,
+            director=str(director).strip(),
+            starring=str(starring).strip(),
+            genres=str(genres).strip(),
             language=language,
             quality=quality,
             rating=rating,
@@ -228,7 +261,6 @@ def create_movie_from_request(request, creator, movie_status):
             status=movie_status,
         )
 
-        # Save each optional resolution separately
         quality_uploads = [
             (video_1080, "1080p"),
             (video_720, "720p"),
@@ -257,11 +289,15 @@ def create_movie_from_request(request, creator, movie_status):
     except Exception:
         logger.exception("Movie upload failed.")
 
+        # Avoid leaving an incomplete movie record if an upload fails.
+        if movie is not None:
+            movie.delete()
+
         return Response(
             {
                 "error": (
-                    "Movie upload failed. Check the server terminal "
-                    "for details."
+                    "Movie upload failed. Check the Django server "
+                    "terminal for details."
                 )
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -269,7 +305,7 @@ def create_movie_from_request(request, creator, movie_status):
 
 
 # =========================================================
-# CREATOR UPLOAD
+# CREATOR OR ADMIN UPLOAD
 # POST /api/movies/create/
 # =========================================================
 
@@ -281,9 +317,7 @@ def create_movie(request):
 
     if not (is_creator(user) or is_admin(user)):
         return Response(
-            {
-                "error": "Only creators or admins can upload movies."
-            },
+            {"error": "Only creators or admins can upload movies."},
             status=status.HTTP_403_FORBIDDEN,
         )
 
@@ -302,11 +336,17 @@ def create_movie(request):
 # =========================================================
 
 class AdminMovieUploadView(generics.GenericAPIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
     serializer_class = MovieUploadSerializer
 
     def post(self, request, *args, **kwargs):
+        if not is_admin(request.user):
+            return Response(
+                {"error": "Admin access required."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         return create_movie_from_request(
             request=request,
             creator=request.user,
@@ -315,7 +355,51 @@ class AdminMovieUploadView(generics.GenericAPIView):
 
 
 # =========================================================
-# APPROVED MOVIES FOR USERS
+# CREATOR: UPDATE OWN MOVIE RATING
+# PATCH /api/movies/<movie_id>/rating/
+# =========================================================
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def update_movie_rating(request, movie_id):
+    user = request.user
+
+    if not is_creator(user):
+        return Response(
+            {"error": "Only creators can change movie ratings."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    movie = get_object_or_404(
+        Movie,
+        id=movie_id,
+        creator=user,
+    )
+
+    if "rating" not in request.data:
+        return upload_error("Rating is required.")
+
+    try:
+        rating = parse_rating(request.data["rating"])
+    except ValueError as error:
+        return upload_error(str(error))
+
+    movie.rating = rating
+    movie.save(update_fields=["rating", "updated_at"])
+
+    movie = get_movie_queryset().get(pk=movie.pk)
+
+    return Response(
+        {
+            "message": "Movie rating updated successfully.",
+            "movie": movie_data(request, movie),
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+# =========================================================
+# APPROVED MOVIES
 # GET /api/movies/approved/
 # =========================================================
 
@@ -347,9 +431,6 @@ def movie_details(request, movie_id):
         id=movie_id,
     )
 
-    # Users can view only approved movies.
-    # Creators can view their own movies.
-    # Admins can view every movie.
     allowed = (
         is_admin(request.user)
         or movie.status == "APPROVED"
@@ -373,6 +454,12 @@ def movie_details(request, movie_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def my_movies(request):
+    if not is_creator(request.user):
+        return Response(
+            {"error": "Creator access required."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
     movies = (
         get_movie_queryset()
         .filter(creator=request.user)
@@ -393,11 +480,9 @@ def my_movies(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def admin_all_movies(request):
-    if not is_admin(request.user):
-        return Response(
-            {"error": "Admin access required."},
-            status=status.HTTP_403_FORBIDDEN,
-        )
+    permission_error = require_admin(request)
+    if permission_error:
+        return permission_error
 
     movies = get_movie_queryset().order_by("-created_at")
 
@@ -415,11 +500,9 @@ def admin_all_movies(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def admin_pending_movies(request):
-    if not is_admin(request.user):
-        return Response(
-            {"error": "Admin access required."},
-            status=status.HTTP_403_FORBIDDEN,
-        )
+    permission_error = require_admin(request)
+    if permission_error:
+        return permission_error
 
     movies = (
         get_movie_queryset()
@@ -434,18 +517,16 @@ def admin_pending_movies(request):
 
 
 # =========================================================
-# ADMIN: APPROVE OR REJECT MOVIE
+# ADMIN: APPROVE OR REJECT
 # POST /api/movies/admin/<movie_id>/review/
 # =========================================================
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def admin_review_movie(request, movie_id):
-    if not is_admin(request.user):
-        return Response(
-            {"error": "Admin access required."},
-            status=status.HTTP_403_FORBIDDEN,
-        )
+    permission_error = require_admin(request)
+    if permission_error:
+        return permission_error
 
     movie = get_object_or_404(Movie, id=movie_id)
 
@@ -458,8 +539,9 @@ def admin_review_movie(request, movie_id):
         )
 
     movie.status = review_status
-    movie.admin_message = admin_message
+    movie.admin_message = str(admin_message).strip()
 
+    # Reviewing a movie does not change its rating.
     movie.save(
         update_fields=[
             "status",
@@ -470,10 +552,13 @@ def admin_review_movie(request, movie_id):
 
     movie = get_movie_queryset().get(pk=movie.pk)
 
-    return Response({
-        "message": f"Movie {review_status.lower()}.",
-        "movie": movie_data(request, movie),
-    })
+    return Response(
+        {
+            "message": f"Movie {review_status.lower()}.",
+            "movie": movie_data(request, movie),
+        },
+        status=status.HTTP_200_OK,
+    )
 
 
 # =========================================================
@@ -484,11 +569,9 @@ def admin_review_movie(request, movie_id):
 @api_view(["DELETE"])
 @permission_classes([IsAuthenticated])
 def admin_delete_movie(request, movie_id):
-    if not is_admin(request.user):
-        return Response(
-            {"error": "Admin access required."},
-            status=status.HTTP_403_FORBIDDEN,
-        )
+    permission_error = require_admin(request)
+    if permission_error:
+        return permission_error
 
     movie = get_object_or_404(Movie, id=movie_id)
     movie.delete()
